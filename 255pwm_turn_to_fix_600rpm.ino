@@ -109,7 +109,6 @@ void reverseBrakeStop(int brakePWM = 255) {
   if (now - lastBrakeTime < 100) return;
   lastBrakeTime = now;
 
-  // Update distance reading
   updateDistanceSinceJunction();
 
   // Choose brake time based on distance
