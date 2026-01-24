@@ -17,14 +17,8 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 
 volatile long leftCount = 0;
 volatile long rightCount = 0;
-// ===============================
-// Distance tracking since last junction
-// ===============================
-long startLeftCount = 0;
-long startRightCount = 0;
-float distSinceJunction_cm = 0;
 
-const int CPR = 400;                    // counts per revolution (your measured value)
+const int CPR = 1414;                    // counts per revolution (your measured value)
 const float wheel_circumference_cm = 13.2; 
 // --- Motor pins ---
 #define lf 14
@@ -48,13 +42,13 @@ float targetYaw = 0.0;
 // --- PID Params ---
 int speed = 255;
 int maxSpeed = speed;
-int baseSpeed = 200;    // cruising forward speed when straight
+int baseSpeed = 255;    // cruising forward speed when straight
 int minSpeed = 150;     // minimum motor speed (avoid stalling)
 int prevLeftSpeed = 0;
 int prevRightSpeed = 0;
 const int SLEW_LIMIT = 18;
-  const float KP = 3.3f;
-  float Kp2 = 110.0;
+float Kp = 50000000000.0;
+float Kp2 = 110.0;
 
 // Behavior tuning
 const int CENTER_DEADZONE = 200; // error units (0..7000) treated as "straight"
@@ -74,63 +68,6 @@ float wrapAngle(float angle) {
   if (angle < -180) angle += 360;
   return angle;
 }
-// Convert encoder counts to cm (average of both wheels)
-float countsToCm(long left, long right) {
-  long avgCounts = (abs(left) + abs(right)) / 2;
-  return (avgCounts / (float)CPR) * wheel_circumference_cm;
-}
-
-// Reset distance measurement at junction
-void resetDistanceSinceJunction() {
-  startLeftCount = leftCount;
-  startRightCount = rightCount;
-  distSinceJunction_cm = 0;
-}
-
-// Update distance measurement continuously
-void updateDistanceSinceJunction() {
-  distSinceJunction_cm = countsToCm(leftCount - startLeftCount, rightCount - startRightCount);
-}
-
-// Decide brake time based on distance travelled in straight run
-int getBrakeMsFromDistance() {
-  if (distSinceJunction_cm > 80.0) return 60;
-  if (distSinceJunction_cm > 60.0) return 50;
-  return 40;  // default (short brake)
-}
-
-// Reverse braking with 100ms cooldown + distance based brake time
-void reverseBrakeStop(int brakePWM = 255) {
-
-  static unsigned long lastBrakeTime = 0;
-  unsigned long now = millis();
-
-  // Cooldown: ignore repeated calls
-  if (now - lastBrakeTime < 100) return;
-  lastBrakeTime = now;
-
-
-  // Update distance reading
-  updateDistanceSinceJunction();
-
-  // Choose brake time based on distance
-  int brakeMs = getBrakeMsFromDistance();
-
-  brakePWM = constrain(brakePWM, 0, 255);
-
-  // Apply reverse briefly
-  analogWrite(lf, 0);
-  analogWrite(lb, brakePWM);
-
-  analogWrite(rf, 0);
-  analogWrite(rb, brakePWM);
-
-  delay(brakeMs);
-
-  stop();
-}
-
-
 
 
 
@@ -228,86 +165,96 @@ void applyMotors(int leftPWM, int rightPWM) {
   prevRightSpeed = rightPWM;
 }
 void lineFollowP() {
-  updateDistanceSinceJunction();
-
-  // Read sensors (invert so black line = 1)
-  for (int i = 0; i < NUM_SENSORS; i++) {
+  for (int i = 0; i < 8; i++) {
+    // invert so black line -> 1, white -> 0 (user requested that logic)
     sensorValues[i] = !digitalRead(sensorPins[i]);
   }
 
-  // Symmetric weights (center = 0)
-  const int weights[8] = { -3500, -2500, -1500, -500, 500, 1500, 2500, 3500 };
-
-  long weightedSum = 0;
+  // Weighted position (indices 0..7 => weights 0..7000)
+  long numerator = 0;
   int activeCount = 0;
-
   for (int i = 0; i < 8; i++) {
     if (sensorValues[i]) {
-      weightedSum += weights[i];
+      numerator += (long)i * 1000L;
       activeCount++;
     }
   }
 
-  int error = (int)(weightedSum / activeCount);
-  lastKnownError = error;
+  // If no sensors active -> lost line
+  if (activeCount == 0) {
+    // gentle search toward last known side (use lastKnownError sign)
+    int steer = 0;
+    if (lastKnownError > 0) steer = 80;       // steer right
+    else if (lastKnownError < 0) steer = -80; // steer left
+    else steer = 0; // unknown, go moderately forward
 
-  // -------- STRAIGHT DEADZONE --------
-  if (abs(error) <= CENTER_DEADZONE) {
-    applyMotors(baseSpeed, baseSpeed);
+    int leftSpeed = baseSpeed - steer;
+    int rightSpeed = baseSpeed + steer;
+
+    // keep within min/max
+    leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
+    rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
+
+    applyMotors(leftSpeed, rightSpeed);
     return;
   }
 
-  // -------- Only center sensors active -> go straight --------
-  bool onlyCenter = sensorValues[CENTER_LOW_INDEX] && sensorValues[CENTER_HIGH_INDEX];
-  if (onlyCenter) {
-    for (int i = 0; i < 8; i++) {
-      if (i != CENTER_LOW_INDEX && i != CENTER_HIGH_INDEX && sensorValues[i]) {
-        onlyCenter = false;
+  int position = (int)(numerator / activeCount); // 0..7000
+  const int center = 3500;
+  int error = position - center; // negative -> line left, positive -> line right
 
-        break;
-      }
+  // Remember last known error for recovery
+  lastKnownError = error;
+
+  // If error is small => treat as straight line (no correction)
+  if (abs(error) <= CENTER_DEADZONE) {
+    int leftSpeed = baseSpeed;
+    int rightSpeed = baseSpeed;
+    applyMotors(leftSpeed, rightSpeed);
+    return;
+  }
+
+  // Quick central-sensors shortcut: if only the two center sensors detect line, go straight
+  bool onlyCenter = (sensorValues[CENTER_LOW_INDEX] && sensorValues[CENTER_HIGH_INDEX]);
+  for (int i = 0; i < 8; i++) {
+    if (i != CENTER_LOW_INDEX && i != CENTER_HIGH_INDEX && sensorValues[i]) {
+      onlyCenter = false;
+      break;
     }
   }
   if (onlyCenter) {
-    applyMotors(baseSpeed, baseSpeed);
+    int leftSpeed = baseSpeed;
+    int rightSpeed = baseSpeed;
+    applyMotors(leftSpeed, rightSpeed);
     return;
   }
 
-  // -------- PD CONTROL (P + D) --------
-  float normError = (float)error / 3500.0f;
+  // Proportional correction (scale error so it maps well to PWM)
+  // position range center..edge ~= 3500 -> use /3500 to normalize
+  int rawCorrection = (int)(Kp * (float)error / 3500.0);
 
-  static float prevNormError = 0.0f;
-  float derivative = normError - prevNormError;
-  prevNormError = normError;
+  // Constrain correction so P doesn't overshoot strongly on sharp errors
+  int maxCorrection = baseSpeed - minSpeed; // prevent stopping one motor completely
+  rawCorrection = constrain(rawCorrection, -maxCorrection, maxCorrection);
 
-  const float KD = 4.0f;   // ✅ tune this (0.2 to 0.7 usually)
-
-  // Convert to PWM correction
-  int correctionLimit = baseSpeed - 40;   // allow turning range
-  if (correctionLimit < 40) correctionLimit = 40;
-
-  int correction = (int)((KP * normError + KD * derivative) * correctionLimit);
-
-  // outer sensors -> boost correction slightly
+  // If the outer sensors are active, we can allow slightly larger corrections
   if (sensorValues[0] || sensorValues[7]) {
-    correction = (int)(correction * 1.25f);
+    // outermost sensor triggered -> increase correction margin slightly (still P-only)
+    rawCorrection = constrain(rawCorrection, -maxCorrection, maxCorrection);
   }
 
-  correction = constrain(correction, -correctionLimit, correctionLimit);
+  // Compute motor speeds
+  int leftSpeed = baseSpeed - rawCorrection;
+  int rightSpeed = baseSpeed + rawCorrection;
 
-  // Motor speeds
-  int leftSpeed  = baseSpeed - correction;
-  int rightSpeed = baseSpeed + correction;
-
-  // Low limit safety (your minSpeed might block turning)
-  int lowLimit = min(minSpeed, baseSpeed / 3);
-  lowLimit = max(20, lowLimit);
-
-  leftSpeed  = constrain(leftSpeed, lowLimit, 255);
-  rightSpeed = constrain(rightSpeed, lowLimit, 255);
+  // Ensure min and max
+  leftSpeed = constrain(leftSpeed, minSpeed, maxSpeed);
+  rightSpeed = constrain(rightSpeed, minSpeed, maxSpeed);
 
   applyMotors(leftSpeed, rightSpeed);
 }
+
+
 
 void update() {
   r4 = !digitalRead(R4);
@@ -351,18 +298,10 @@ void forward(int spd, float distance_cm) {
 }
 
 // ---------- STOP function ----------
-// ===============================
-// REVERSE BRAKE STOP (Plugging)
-// Works with L298N when PWM is on IN pins
-// ===============================
-
-// Normal coast stop
 void stop() {
   analogWrite(lf, 0); analogWrite(lb, 0);
   analogWrite(rf, 0); analogWrite(rb, 0);
 }
-
-// Reverse braking: apply reverse PWM briefly, then stop
 
 // ---------- Encoder ISRs ----------
 void IRAM_ATTR isr_left() {
@@ -378,39 +317,6 @@ void IRAM_ATTR isr_right() {
   if (A == B) rightCount++;
   else rightCount--;
 }
-void alignToLine(int alignSpeed = 100) {
-  update();
-
-  // Already aligned
-  if (l2 == 0 || r2 == 0) {
-    return;
-  }
-
-  // Line detected on RIGHT side → rotate RIGHT
-  if (r2 == 0 || r3 == 0 || r4 == 0) {
-    while (true) {
-      update();
-      if (l1 == 0 || r1 == 0) break;
-
-      analogWrite(lf, alignSpeed);
-      analogWrite(lb, 0);
-      analogWrite(rf, 0);
-      analogWrite(rb, alignSpeed);
-    }
-  }
-  // Line detected on LEFT side → rotate LEFT
-  else if (l2 == 0 || l3 == 0 || l4 == 0) {
-    while (true) {
-      update();
-      if (l1 == 0 || r1 == 0) break;
-
-      analogWrite(lf, 0);
-      analogWrite(lb, alignSpeed);
-      analogWrite(rf, alignSpeed);
-      analogWrite(rb, 0);
-    }
-  }
-}
 
 void turnToYaw(float targetYaw) {
   unsigned long startTime = millis();
@@ -420,17 +326,16 @@ void turnToYaw(float targetYaw) {
     float error = wrapAngle(targetYaw - currentYaw); // -180 .. +180
     float absError = abs(error);
     update();
-    if((l2 == 0 || r2 == 0)&& absError <60){
-      alignToLine(); 
+    if((l1 == 0 || r1 == 0)&& absError <45){
       break;
     }
     // Stop condition
-    if (absError <= 5.0){alignToLine(); break;}
+    if (absError <= 2.0) break;
     if (millis() - startTime > 4000) break;  // safety timeout
 
     // Proportional speed control
-    int turnSpeed = (int)(absError * 2.6);   // KP ≈ 3
-    turnSpeed = constrain(turnSpeed, 70, speed);
+    int turnSpeed = (int)(absError * 3.0);   // KP ≈ 3
+    turnSpeed = constrain(turnSpeed, 70, 220);
 
     // Direction based on sign of error
     if (error > 0) {
@@ -449,14 +354,14 @@ void turnToYaw(float targetYaw) {
 }
 void left(int speed) {
   float startYaw = getYaw();
-  float targetYaw = startYaw - 90.0;
+  float targetYaw = startYaw - 110.0;
   if (targetYaw < 0) targetYaw += 360.0;
 
   turnToYaw(targetYaw);
 }
 void right(int speed) {
   float startYaw = getYaw();
-  float targetYaw = startYaw + 90.0;
+  float targetYaw = startYaw + 110.0;
   if (targetYaw >= 360.0) targetYaw -= 360.0;
 
   turnToYaw(targetYaw);
@@ -465,11 +370,26 @@ void right(int speed) {
 
 // ---- U-TURN (180° shortest spin) ----
 void u_turn(int speed) {
-   float startYaw = getYaw();
-  float targetYaw = startYaw + 170.0;
-  if (targetYaw >= 360.0) targetYaw -= 360.0;
+  float startYaw = getYaw();
+  float targetYaw = startYaw - 170.0;
+  if (targetYaw < 0) targetYaw += 360.0;
 
-  turnToYaw(targetYaw);
+  // Force CCW rotation
+  while (true) {
+    float currentYaw = getYaw();
+    float error = wrapAngle(targetYaw - currentYaw);
+      if((l1 == 0 || l2 == 0)&& abs(error) <45){
+      break;
+    }
+    if (abs(error) <= 2.0) break;
+
+    int turnSpeed = constrain(abs(error) * 3.0, 80, 220);
+
+    driveMotors(-turnSpeed, turnSpeed);  // CCW ONLY
+    delay(10);
+  }
+
+  stop();
 }
 
 
@@ -502,6 +422,39 @@ void driveMotors(int leftPWM, int rightPWM) {
   }
 }
 
+void alignToLine(int alignSpeed = 150) {
+  update();
+
+  // Already aligned
+  if (l1 == 0 || r1 == 0) {
+    return;
+  }
+
+  // Line detected on RIGHT side → rotate RIGHT
+  if (r2 == 0 || r3 == 0 || r4 == 0) {
+    while (true) {
+      update();
+      if (l1 == 0 || r1 == 0) break;
+
+      analogWrite(lf, alignSpeed);
+      analogWrite(lb, 0);
+      analogWrite(rf, 0);
+      analogWrite(rb, alignSpeed);
+    }
+  }
+  // Line detected on LEFT side → rotate LEFT
+  else if (l2 == 0 || l3 == 0 || l4 == 0) {
+    while (true) {
+      update();
+      if (l1 == 0 || r1 == 0) break;
+
+      analogWrite(lf, 0);
+      analogWrite(lb, alignSpeed);
+      analogWrite(rf, alignSpeed);
+      analogWrite(rb, 0);
+    }
+  }
+}
 
 #define BUTTON_PIN 4  // your button connected to GPIO14 and GND
 #define led 16
@@ -642,17 +595,17 @@ bool junctionCandidate =
     (r3 == 1 && r4 == 1 && l3 == 0 && l4 == 0 && l2 == 0)||(r3 == 1 && r4 == 1 && l3 == 1 && l4 == 1 && r2 == 1 && r1 == 1 && l2 == 1 && l1 == 1);
 
     if (junctionCandidate) {
-      resetDistanceSinceJunction();
-
-
-      stop();
       // 🔹 STEP 1: move slightly into junction
+      stop();
+      forward(speed, 1);
+      delay(5);
+      update();
+
       // 🔹 STEP 2: NOW evaluate full junction logic
 
       // ===== DEAD END / END NODE =====
       if (r3 == 0 && r4 == 0 && l3 == 0 && l4 == 0 &&
           r2 == 0 && r1 == 0 && l2 == 0 && l1 == 0) {
-      reverseBrakeStop();
 
         stop();
         forward(speed, 6);
@@ -676,8 +629,6 @@ bool junctionCandidate =
 
       // ===== LEFT JUNCTION =====
       if (r3 == 1 && r4 == 1 && l3 == 0 && l4 == 0 && l2 == 0) {
-              reverseBrakeStop();
-
         stop();
         forward(speed, 6);
         stop();
@@ -698,8 +649,6 @@ bool junctionCandidate =
 
       // ===== RIGHT / STRAIGHT =====
       if (r3 == 0 && r4 == 0 && l3 == 1 && l4 == 1 && r2 == 0) {
-              reverseBrakeStop();
-
         stop();
         forward(speed, 6);
         stop();
